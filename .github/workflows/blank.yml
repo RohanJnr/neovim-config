@@ -1,31 +1,129 @@
-# This is a basic workflow to help you get started with Actions
-
-name: CI-dispatch
-
-# Controls when the workflow will run
+name: Deploy
 on:
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create release?'
+        required: true
+        type: boolean
+        default: true
+      commit-sha:
+        description: 'Commit SHA to deploy to production'
+        required: false
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  create-release:
+    permissions: write-all
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Release Branch
+        id: release_branch
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
-          echo "${{ github.sha }}"
+         RELEASE_BRANCH="${{ github.head_ref || github.ref_name }}"
+         echo release_branch=$RELEASE_BRANCH
+         echo "name=$RELEASE_BRANCH" >> "$GITHUB_OUTPUT" 
+      - name: Calver Release
+        uses: StephaneBour/actions-calver@master
+        id: calver
+        with:
+          release_branch: ${{ steps.release_branch.outputs.name }} 
+          release: ${{ github.event.inputs.create_release }}
+          date_format: "%Y-%m-%d"
+          version_regexp: "^20[0-9][0-9]-[0-1][0-9]-[0-3][0-9]"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      calver-version: ${{ steps.calver.outputs.release }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: create-release
+    env:
+      RELEASE_VERSION: ${{ needs.create-release.outputs.calver-version }}
+
+    steps:
+      - name: Configure non prod AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon non prod ECR
+        id: login-ecr-non-prod
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pull Image API and UI image from non prod
+        env:
+          NON_PROD_ECR_REGISTRY: ${{ steps.login-ecr-non-prod.outputs.registry }}
+          NON_PROD_ECR_REPOSITORY_API: techdd-api
+          NON_PROD_ECR_REPOSITORY_UI: techdd-ui
+          NON_PROD_IMAGE_TAG: ${{ github.event.inputs.commit-sha || github.sha }}
+        run: |
+          docker pull $NON_PROD_ECR_REGISTRY/$NON_PROD_ECR_REPOSITORY_API:$NON_PROD_IMAGE_TAG
+          docker pull $NON_PROD_ECR_REGISTRY/$NON_PROD_ECR_REPOSITORY_UI:$NON_PROD_IMAGE_TAG
+
+      - name: Configure prod AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ROLE_TO_ASSUME_PROD }}
+          aws-region: ${{ secrets.AWS_REGION_PROD }}
+
+      - name: Login to Amazon prod ECR
+        id: login-ecr-prod
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Re-tag images for prod ECR
+        env:
+            NON_PROD_ECR_REGISTRY: ${{ steps.login-ecr-non-prod.outputs.registry }}
+            NON_PROD_ECR_REPOSITORY_API: techdd-api
+            NON_PROD_ECR_REPOSITORY_UI: techdd-ui
+            NON_PROD_IMAGE_TAG: ${{ github.event.inputs.commit-sha || github.sha }}
+
+            PROD_ECR_REGISTRY: ${{ steps.login-ecr-prod.outputs.registry }}
+            PROD_ECR_REPOSITORY_API: techdd-api-prod
+            PROD_ECR_REPOSITORY_UI: techdd-ui-prod
+            PROD_IMAGE_TAG: ${{ env.RELEASE_VERSION }}
+        run: |
+          docker tag $NON_PROD_ECR_REGISTRY/$NON_PROD_ECR_REPOSITORY_API:$NON_PROD_IMAGE_TAG $PROD_ECR_REGISTRY/$PROD_ECR_REPOSITORY_API:$PROD_IMAGE_TAG
+          docker tag $NON_PROD_ECR_REGISTRY/$NON_PROD_ECR_REPOSITORY_UI:$NON_PROD_IMAGE_TAG $PROD_ECR_REGISTRY/$PROD_ECR_REPOSITORY_UI:$PROD_IMAGE_TAG
+          docker push $PROD_ECR_REGISTRY/$PROD_ECR_REPOSITORY_API:$PROD_IMAGE_TAG
+          docker push $PROD_ECR_REGISTRY/$PROD_ECR_REPOSITORY_UI:$PROD_IMAGE_TAG
+
+      - uses: actions/checkout@v4
+      - name: copy file via ssh key
+        uses: easingthemes/ssh-deploy@v2.1.5
+        env:
+          REMOTE_HOST: ${{ secrets.SSH_HOST_PROD }}
+          REMOTE_USER: ${{ secrets.USERNAME_PROD }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY_PROD }}
+          SOURCE: "deployment/*"
+          TARGET: /home/ubuntu/
+
+      - name: Deploy containers
+        uses: appleboy/ssh-action@master
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr-prod.outputs.registry }}
+          ECR_REPOSITORY_API: techdd-api-prod
+          ECR_REPOSITORY_UI: techdd-ui-prod
+          IMAGE_TAG: ${{ env.RELEASE_VERSION }}
+        with:
+          host: ${{ secrets.SSH_HOST_PROD }}
+          username: ${{ secrets.USERNAME_PROD }}
+          key: ${{ secrets.SSH_PRIVATE_KEY_PROD }}
+          envs: ECR_REGISTRY, ECR_REPOSITORY_API, ECR_REPOSITORY_UI, IMAGE_TAG
+          script: |
+            echo "API_IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG" > .env.docker.prod
+            echo "WEB_IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY_UI:$IMAGE_TAG" >> .env.docker.prod
+            docker-compose -f docker-compose.prod.yml --env-file .env.docker.prod down
+            docker-compose -f docker-compose.prod.yml --env-file .env.docker.prod up --build -d
+
+
+
+
+
+
+

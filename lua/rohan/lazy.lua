@@ -86,6 +86,9 @@ local plugins = {
 			require("nvim-ts-autotag").setup()
 		end,
 	},
+    {
+        "m4xshen/autoclose.nvim"
+    }
 }
 
 require("lazy").setup(plugins)

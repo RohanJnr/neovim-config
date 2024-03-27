@@ -1,0 +1,19 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  do-something:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Echo something
+        run: echo "Something"
+
+  test-dispatch:
+    needs:
+      - do-something
+    uses: ./.github/workflows/blank.yml
